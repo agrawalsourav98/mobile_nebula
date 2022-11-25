@@ -12,6 +12,11 @@ import android.util.Log
 import androidx.work.*
 import mobileNebula.CIDR
 import java.io.File
+import java.io.IOException
+import android.util.JsonWriter
+import android.util.JsonReader
+import java.io.InputStreamReader
+import java.io.OutputStreamWriter
 
 
 class NebulaVpnService : VpnService() {
@@ -21,6 +26,7 @@ class NebulaVpnService : VpnService() {
 
         const val ACTION_STOP = "net.defined.mobile_nebula.STOP"
         const val ACTION_RELOAD = "net.defined.mobile_nebula.RELOAD"
+        const val ACTION_ANDROID_START = "android.net.VpnService"
 
         const val MSG_REGISTER_CLIENT = 1
         const val MSG_UNREGISTER_CLIENT = 2
@@ -49,6 +55,7 @@ class NebulaVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
     private var didSleep = false
     private var networkCallback: NetworkCallback = NetworkCallback()
+    private var runningSiteID: String? = null
 
     override fun onCreate() {
         workManager = WorkManager.getInstance(this)
@@ -61,7 +68,17 @@ class NebulaVpnService : VpnService() {
             return Service.START_NOT_STICKY
         }
 
-        val id = intent?.getStringExtra("id")
+        var id = intent?.getStringExtra("id")
+
+        if (intent?.action == ACTION_ANDROID_START) {
+            val (lastId, lastPath) = getLastSite()
+            if (lastId != null) {
+                id = lastId
+                path = lastPath
+            } else {
+                return Service.START_NOT_STICKY
+            }
+        }
 
         if (running) {
             // if the UI triggers this twice, check if we are already running the requested site. if not, return an error.
@@ -74,7 +91,10 @@ class NebulaVpnService : VpnService() {
             return super.onStartCommand(intent, flags, startId)
         }
 
-        path = intent!!.getStringExtra("path")!!
+        if (intent?.action != ACTION_ANDROID_START) {
+            path = intent!!.getStringExtra("path")!!
+        }
+
         //TODO: if we fail to start, android will attempt a restart lacking all the intent data we need.
         // Link active site config in Main to avoid this
         site = Site(this, File(path!!))
@@ -104,12 +124,12 @@ class NebulaVpnService : VpnService() {
         }
 
         val builder = Builder()
-                .addAddress(ipNet.ip, ipNet.maskSize.toInt())
-                .addRoute(ipNet.network, ipNet.maskSize.toInt())
-                .setMtu(site!!.mtu)
-                .setSession(TAG)
-                .allowFamily(OsConstants.AF_INET)
-                .allowFamily(OsConstants.AF_INET6)
+            .addAddress(ipNet.ip, ipNet.maskSize.toInt())
+            .addRoute(ipNet.network, ipNet.maskSize.toInt())
+            .setMtu(site!!.mtu)
+            .setSession(TAG)
+            .allowFamily(OsConstants.AF_INET)
+            .allowFamily(OsConstants.AF_INET6)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             builder.setMetered(false)
@@ -123,7 +143,12 @@ class NebulaVpnService : VpnService() {
 
         try {
             vpnInterface = builder.establish()
-            nebula = mobileNebula.MobileNebula.newNebula(site!!.config, site!!.getKey(this), site!!.logFile, vpnInterface!!.detachFd().toLong())
+            nebula = mobileNebula.MobileNebula.newNebula(
+                site!!.config,
+                site!!.getKey(this),
+                site!!.logFile,
+                vpnInterface!!.detachFd().toLong()
+            )
 
         } catch (e: Exception) {
             Log.e(TAG, "Got an error $e")
@@ -139,12 +164,15 @@ class NebulaVpnService : VpnService() {
 
         nebula!!.start()
         running = true
+        runningSiteID = site!!.id
+        updateLastSite()
         sendSimple(MSG_IS_RUNNING, 1)
     }
 
     // Used to detect network changes (wifi -> cell or vice versa) and rebinds the udp socket/updates LH
     private fun registerNetworkCallback() {
-        val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val connectivityManager =
+            getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
         val builder = NetworkRequest.Builder()
         builder.addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
@@ -153,11 +181,12 @@ class NebulaVpnService : VpnService() {
     }
 
     private fun unregisterNetworkCallback() {
-        val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val connectivityManager =
+            getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         connectivityManager.unregisterNetworkCallback(networkCallback)
     }
 
-    inner class NetworkCallback : ConnectivityManager.NetworkCallback () {
+    inner class NetworkCallback : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             super.onAvailable(network)
             nebula!!.rebind("network change")
@@ -213,11 +242,12 @@ class NebulaVpnService : VpnService() {
         nebula?.stop()
         nebula = null
         running = false
+        runningSiteID = null
         announceExit(site?.id, null)
         stopSelf()
     }
 
-    override fun onRevoke()  {
+    override fun onRevoke() {
         stopVpn()
         //TODO: wait for the thread to exit
         super.onRevoke()
@@ -236,6 +266,87 @@ class NebulaVpnService : VpnService() {
             Log.e(TAG, "$err")
         }
         send(msg, id)
+    }
+
+    private fun updateLastSite() {
+        if (runningSiteID != null) {
+            this.openFileOutput(
+                "lastusedsite.json",
+                Context.MODE_PRIVATE
+            ).use {
+                val writer: JsonWriter = JsonWriter(java.io.OutputStreamWriter(it))
+                writer.setIndent("  ")
+                writer.beginObject()
+                writer.name("id").value(runningSiteID)
+                writer.name("path").value(path!!)
+                writer.endObject()
+                writer.close()
+            }
+        }
+    }
+
+    private fun getLastSite(): Pair<String?, String?> {
+        try {
+            this.openFileInput("lastusedsite.json").use {
+                var lastId: String? = null
+                var lastPath: String? = null
+                val reader: JsonReader = JsonReader(InputStreamReader(it))
+                try {
+                    reader.beginObject()
+                    while (reader.hasNext()) {
+                        val name: String = reader.nextName()
+                        if (name.equals("id"))
+                            lastId = reader.nextString()
+                        else if (name.equals("path"))
+                            lastPath = reader.nextString()
+                        else
+                            reader.skipValue()
+                    }
+                } finally {
+                    reader.close()
+                    if (lastId != null) {
+                        val site = Site(this, File(lastPath!!))
+                        if (checkIfSiteIsValid(site))
+                            return Pair(lastId, lastPath)
+                    }
+                    return getFirstValidSite()
+                }
+            }
+
+        } catch (e: Exception) {
+            return getFirstValidSite()
+        }
+    }
+
+    private fun getFirstValidSite(): Pair<String?, String?> {
+        val siteList: SiteList = SiteList(this)
+
+        val sites: Map<String, Site> = siteList.getSites()
+
+        val iter = sites.keys.iterator()
+
+        if (iter.hasNext()) {
+            val firstKey = iter.next()
+            val firstVal = sites[firstKey]
+            return Pair(firstKey!!, firstVal!!.path!!)
+        } else {
+            return Pair(null, null)
+        }
+    }
+
+    private fun checkIfSiteIsValid(site: Site): Boolean {
+        try {
+            site.getKey(this)
+
+            // Make sure we can load the DN credentials if managed
+            if (site.managed) {
+                site.getDNCredentials(this)
+            }
+            return true
+        } catch (err: Exception) {
+            return false
+        }
+
     }
 
     inner class ReloadReceiver : BroadcastReceiver() {
@@ -291,7 +402,9 @@ class NebulaVpnService : VpnService() {
         }
 
         private fun listHostmap(msg: Message) {
-            if (protect(msg)) { return }
+            if (protect(msg)) {
+                return
+            }
 
             val res = nebula!!.listHostmap(msg.what == MSG_LIST_PENDING_HOSTMAP)
             val m = Message.obtain(null, msg.what)
@@ -300,25 +413,35 @@ class NebulaVpnService : VpnService() {
         }
 
         private fun getHostInfo(msg: Message) {
-            if (protect(msg)) { return }
+            if (protect(msg)) {
+                return
+            }
 
-            val res = nebula!!.getHostInfoByVpnIp(msg.data.getString("vpnIp"), msg.data.getBoolean("pending"))
+            val res = nebula!!.getHostInfoByVpnIp(
+                msg.data.getString("vpnIp"),
+                msg.data.getBoolean("pending")
+            )
             val m = Message.obtain(null, msg.what)
             m.data.putString("data", res)
             msg.replyTo.send(m)
         }
 
         private fun setRemoteForTunnel(msg: Message) {
-            if (protect(msg)) { return }
+            if (protect(msg)) {
+                return
+            }
 
-            val res = nebula!!.setRemoteForTunnel(msg.data.getString("vpnIp"), msg.data.getString("addr"))
+            val res =
+                nebula!!.setRemoteForTunnel(msg.data.getString("vpnIp"), msg.data.getString("addr"))
             val m = Message.obtain(null, msg.what)
             m.data.putString("data", res)
             msg.replyTo.send(m)
         }
 
         private fun closeTunnel(msg: Message) {
-            if (protect(msg)) { return }
+            if (protect(msg)) {
+                return
+            }
 
             val res = nebula!!.closeTunnel(msg.data.getString("vpnIp"))
             val m = Message.obtain(null, msg.what)
@@ -351,10 +474,12 @@ class NebulaVpnService : VpnService() {
     }
 
     override fun onBind(intent: Intent?): IBinder? {
+        Log.d("INTENT", "Calling binder")
         if (intent != null && SERVICE_INTERFACE == intent.action) {
+            Log.d("INTENT", "Using super.onBind")
             return super.onBind(intent)
         }
-
+        Log.d("INTENT", "Using Messenger")
         messenger = Messenger(IncomingHandler())
         return messenger.binder
     }
