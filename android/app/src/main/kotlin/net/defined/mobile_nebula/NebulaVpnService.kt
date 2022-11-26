@@ -75,11 +75,15 @@ class NebulaVpnService : VpnService() {
     }
 
     private fun createNotificationChannel(id: String?,name: String?) : NotificationChannel {
-        return NotificationChannel(
+        val nChannel =  NotificationChannel(
             id,
             name,
             NotificationManager.IMPORTANCE_LOW
         )
+        val notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.createNotificationChannel(nChannel)
+
+        return nChannel
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -87,7 +91,7 @@ class NebulaVpnService : VpnService() {
         var foreground = false
 
         if (intent == null){
-            return Service.START_NOT_STICKY
+            return super.onStartCommand(intent, flags, startId)
         }
 
         if (intent.action == ACTION_START_EXTERNAL || intent.action == ACTION_STOP_EXTERNAL || intent.action == ACTION_ANDROID_ALWAYS_ON){
@@ -98,7 +102,7 @@ class NebulaVpnService : VpnService() {
         if (intent.action == ACTION_STOP || intent.action == ACTION_STOP_EXTERNAL){
             stopVpn()
             if (foreground){
-                stopForeground(STOP_FOREGROUND_REMOVE)
+                this.stopForeground(STOP_FOREGROUND_REMOVE)
             }
             return Service.START_NOT_STICKY
         }
@@ -112,8 +116,8 @@ class NebulaVpnService : VpnService() {
                 id = lastId
                 path = lastPath
             } else {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                return Service.START_NOT_STICKY
+                this.stopForeground(STOP_FOREGROUND_REMOVE)
+                return super.onStartCommand(intent, flags, startId)
             }
         }
 
@@ -124,7 +128,7 @@ class NebulaVpnService : VpnService() {
                 announceExit(id, "Trying to run nebula but it is already running")
             }
             if (foreground){
-                stopForeground(STOP_FOREGROUND_REMOVE)
+                this.stopForeground(STOP_FOREGROUND_REMOVE)
             }
             //TODO: can we signal failure?
             return super.onStartCommand(intent, flags, startId)
