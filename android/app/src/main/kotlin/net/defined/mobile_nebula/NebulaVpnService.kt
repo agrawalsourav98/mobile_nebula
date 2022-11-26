@@ -1,5 +1,8 @@
 package net.defined.mobile_nebula
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -12,11 +15,6 @@ import android.util.Log
 import androidx.work.*
 import mobileNebula.CIDR
 import java.io.File
-import java.io.IOException
-import android.util.JsonWriter
-import android.util.JsonReader
-import java.io.InputStreamReader
-import java.io.OutputStreamWriter
 
 
 class NebulaVpnService : VpnService() {
@@ -26,7 +24,9 @@ class NebulaVpnService : VpnService() {
 
         const val ACTION_STOP = "net.defined.mobile_nebula.STOP"
         const val ACTION_RELOAD = "net.defined.mobile_nebula.RELOAD"
-        const val ACTION_ANDROID_START = "android.net.VpnService"
+        const val ACTION_ANDROID_ALWAYS_ON = "android.net.VpnService"
+        const val ACTION_START_EXTERNAL = "net.defined.mobile_nebula.START_EXTERNAL"
+        const val ACTION_STOP_EXTERNAL = "net.defined.mobile_nebula.STOP_EXTERNAL"
 
         const val MSG_REGISTER_CLIENT = 1
         const val MSG_UNREGISTER_CLIENT = 2
@@ -62,20 +62,57 @@ class NebulaVpnService : VpnService() {
         super.onCreate()
     }
 
+    private fun createNotification(text: String): Notification {
+
+        val notificationChannel = createNotificationChannel("1","Background Service Notification")
+
+        return Notification.Builder(this, notificationChannel.id)
+            .setContentTitle("Nebula VPN Service")
+            .setContentText(text)
+            .setSmallIcon(R.mipmap.ic_launcher_round)
+            .setTicker("Nebula VPN Service")
+            .build()
+    }
+
+    private fun createNotificationChannel(id: String?,name: String?) : NotificationChannel {
+        return NotificationChannel(
+            id,
+            name,
+            NotificationManager.IMPORTANCE_LOW
+        )
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopVpn()
+        val notificationID: Int = (0..Int.MAX_VALUE).random()
+        var foreground = false
+
+        if (intent == null){
             return Service.START_NOT_STICKY
         }
 
-        var id = intent?.getStringExtra("id")
+        if (intent.action == ACTION_START_EXTERNAL || intent.action == ACTION_STOP_EXTERNAL || intent.action == ACTION_ANDROID_ALWAYS_ON){
+            this.startForeground(notificationID, createNotification(""))
+            foreground = true
+        }
 
-        if (intent?.action == ACTION_ANDROID_START) {
-            val (lastId, lastPath) = getLastSite()
-            if (lastId != null) {
+        if (intent.action == ACTION_STOP || intent.action == ACTION_STOP_EXTERNAL){
+            stopVpn()
+            if (foreground){
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            }
+            return Service.START_NOT_STICKY
+        }
+
+        var id = intent.getStringExtra("id")
+
+        if (intent.action == ACTION_ANDROID_ALWAYS_ON) {
+            val start = (intent.getStringExtra("action") ?: "start") == "start"
+            val (lastId, lastPath) = LastSiteInformation.getLastSite(this)
+            if (lastId != null && start) {
                 id = lastId
                 path = lastPath
             } else {
+                stopForeground(STOP_FOREGROUND_REMOVE)
                 return Service.START_NOT_STICKY
             }
         }
@@ -86,13 +123,15 @@ class NebulaVpnService : VpnService() {
             if (site!!.id != id) {
                 announceExit(id, "Trying to run nebula but it is already running")
             }
-
+            if (foreground){
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            }
             //TODO: can we signal failure?
             return super.onStartCommand(intent, flags, startId)
         }
 
-        if (intent?.action != ACTION_ANDROID_START) {
-            path = intent!!.getStringExtra("path")!!
+        if (intent.action != ACTION_ANDROID_ALWAYS_ON) {
+            path = intent.getStringExtra("path")!!
         }
 
         //TODO: if we fail to start, android will attempt a restart lacking all the intent data we need.
@@ -110,6 +149,15 @@ class NebulaVpnService : VpnService() {
         workManager!!.enqueue(workRequest)
 
         // We don't actually start here. In order to properly capture boot errors we wait until an IPC connection is made
+
+        // Start VPN Service if not running
+        if ((intent.action == ACTION_START_EXTERNAL || intent.action == ACTION_ANDROID_ALWAYS_ON) && !running) {
+            startVpn()
+        }
+
+        if (foreground){
+            this.stopForeground(STOP_FOREGROUND_REMOVE)
+        }
 
         return super.onStartCommand(intent, flags, startId)
     }
@@ -165,7 +213,7 @@ class NebulaVpnService : VpnService() {
         nebula!!.start()
         running = true
         runningSiteID = site!!.id
-        updateLastSite()
+        LastSiteInformation.updateLastSite(this, runningSiteID, path)
         sendSimple(MSG_IS_RUNNING, 1)
     }
 
@@ -266,87 +314,6 @@ class NebulaVpnService : VpnService() {
             Log.e(TAG, "$err")
         }
         send(msg, id)
-    }
-
-    private fun updateLastSite() {
-        if (runningSiteID != null) {
-            this.openFileOutput(
-                "lastusedsite.json",
-                Context.MODE_PRIVATE
-            ).use {
-                val writer: JsonWriter = JsonWriter(java.io.OutputStreamWriter(it))
-                writer.setIndent("  ")
-                writer.beginObject()
-                writer.name("id").value(runningSiteID)
-                writer.name("path").value(path!!)
-                writer.endObject()
-                writer.close()
-            }
-        }
-    }
-
-    private fun getLastSite(): Pair<String?, String?> {
-        try {
-            this.openFileInput("lastusedsite.json").use {
-                var lastId: String? = null
-                var lastPath: String? = null
-                val reader: JsonReader = JsonReader(InputStreamReader(it))
-                try {
-                    reader.beginObject()
-                    while (reader.hasNext()) {
-                        val name: String = reader.nextName()
-                        if (name.equals("id"))
-                            lastId = reader.nextString()
-                        else if (name.equals("path"))
-                            lastPath = reader.nextString()
-                        else
-                            reader.skipValue()
-                    }
-                } finally {
-                    reader.close()
-                    if (lastId != null) {
-                        val site = Site(this, File(lastPath!!))
-                        if (checkIfSiteIsValid(site))
-                            return Pair(lastId, lastPath)
-                    }
-                    return getFirstValidSite()
-                }
-            }
-
-        } catch (e: Exception) {
-            return getFirstValidSite()
-        }
-    }
-
-    private fun getFirstValidSite(): Pair<String?, String?> {
-        val siteList: SiteList = SiteList(this)
-
-        val sites: Map<String, Site> = siteList.getSites()
-
-        val iter = sites.keys.iterator()
-
-        if (iter.hasNext()) {
-            val firstKey = iter.next()
-            val firstVal = sites[firstKey]
-            return Pair(firstKey!!, firstVal!!.path!!)
-        } else {
-            return Pair(null, null)
-        }
-    }
-
-    private fun checkIfSiteIsValid(site: Site): Boolean {
-        try {
-            site.getKey(this)
-
-            // Make sure we can load the DN credentials if managed
-            if (site.managed) {
-                site.getDNCredentials(this)
-            }
-            return true
-        } catch (err: Exception) {
-            return false
-        }
-
     }
 
     inner class ReloadReceiver : BroadcastReceiver() {
@@ -474,12 +441,9 @@ class NebulaVpnService : VpnService() {
     }
 
     override fun onBind(intent: Intent?): IBinder? {
-        Log.d("INTENT", "Calling binder")
         if (intent != null && SERVICE_INTERFACE == intent.action) {
-            Log.d("INTENT", "Using super.onBind")
             return super.onBind(intent)
         }
-        Log.d("INTENT", "Using Messenger")
         messenger = Messenger(IncomingHandler())
         return messenger.binder
     }

@@ -6,7 +6,8 @@
          additional functionality it is fine to subclass or reimplement
          FlutterApplication and put your custom class here. -->
     <uses-permission android:name="android.permission.INTERNET"/>
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-feature android:name="android.hardware.camera" android:required="false"
         tools:replace="required" />
     <queries>
@@ -51,6 +52,13 @@
                 <data android:scheme="https"/>
             </intent-filter>
         </activity>
+        <receiver android:name=".ExternalVpnBroadcastReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="net.defined.mobile_nebula.START_NEBULA"/>
+                <action android:name="net.defined.mobile_nebula.STOP_NEBULA"/>
+            </intent-filter>
+        </receiver>
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.provider"
